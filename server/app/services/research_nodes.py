@@ -3,6 +3,19 @@ from langchain_groq import ChatGroq
 from pydantic import BaseModel
 from typing import List, Dict
 from tavily import TavilyClient
+from app.services.scraper import create_driver, crawl
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+import json
+import requests
+import time
+import random
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import NoSuchElementException
+from app.services.json_files import create_json_file
 
 class ResearchState(BaseModel):
     topic: str
@@ -21,6 +34,51 @@ llm = ChatGroq(
 )
 
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+
+
+def search_wikipedia(query, limit=5):
+    url = "https://en.wikipedia.org/w/api.php"
+
+    headers = {
+        "User-Agent": "MyResearchBot/1.0 (mosman257@gmail.com)"
+    }
+    params = {
+        "action": "query",
+        "list": "search",
+        "srsearch": query,
+        "format": "json",
+        "srlimit": limit
+    }
+    response = requests.get(url, params=params, headers=headers)
+    if response.status_code != 200:
+        print("Error:", response.status_code)
+        return []
+    return response.json()
+
+def extract_wiki_links(api_response):
+    links = []
+    for item in api_response.get("query", {}).get("search", []):
+        title = item["title"].replace(" ", "_")
+        url = f"https://en.wikipedia.org/wiki/{title}"
+        links.append(url)
+    return links
+
+
+def recursive_web_crawler():
+    topic = "Impact of AI on the job market"
+    driver = create_driver()
+    seed_urls = extract_wiki_links(search_wikipedia(topic))
+    driver = create_driver()
+    all_data = []
+    for seed in seed_urls:
+        seed_url = seed
+        data = crawl(seed_url, seed, driver)
+        all_data.extend(data)
+    driver.quit()
+    create_json_file(all_data)
+    # json_data = json.dumps(all_data, indent=4)
+    # print(json_data)
+
 
 
 def subtopics_node(state: ResearchState):
@@ -76,7 +134,6 @@ def gap_detector_node(state: ResearchState):
     return state
 
 
-
 def cross_analysis_node(state: ResearchState):
     messages = [
         (
@@ -124,13 +181,34 @@ def final_report_node(state: ResearchState):
 
 
 def mind_map_node(state: ResearchState):
-    mind_map = ["graph TD"]
-    mind_map.append(f"A[Topic: {state.topic}]")
-    for i, subtopic in enumerate(state.subtopics):
-        mind_map.append(f"A --> B{i}[{subtopic}]")
-        finding_text = state.findings.get(subtopic, "No findings")
-        mind_map.append(f"B{i} --> C{i}[{finding_text[:50]}...]")  # truncated for readability
-    for j, gap in enumerate(state.gaps):
-        mind_map.append(f"A -.-> D{j}[Gap: {gap}]")
-    state.mind_map = "\n".join(mind_map)
+    prompt = f"""
+    Generate a clean and readable Mermaid mind map.
+
+    Rules:
+    - Use graph LR
+    - Keep it compact
+    - Group subtopics under categories
+    - Avoid very long text (max 6 words per node)
+    - No markdown formatting (**)
+    - Valid Mermaid syntax only
+
+    Topic: {state.topic}
+
+    Subtopics:
+    {state.subtopics}
+
+    Research Gaps:
+    {state.gaps}
+
+    Output only Mermaid code.
+    """
+
+    response = llm.invoke(
+        [
+            ("system", "You are an expert at generating valid Mermaid diagrams."),
+            ("human", prompt),
+        ]
+    )
+
+    state.mind_map = response.content.strip()
     return state
